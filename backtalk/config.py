@@ -54,6 +54,18 @@ DEFAULTS = {
     # lasts one session and is always spoken; this default never moves
     # by itself.
     "deep_model": "claude-opus-5",
+    # Named models a GUI face can offer as a live switch (see
+    # signals.py's .model_request / .model_current pair). Keys are
+    # display labels, values are full model ids ON PURPOSE, same
+    # reasoning as "model" above. This is separate from the "deep"/
+    # "fast" voice-console verbs, which stay a simple two-way toggle;
+    # this list is for a picker that shows more than two options.
+    "available_models": {
+        "Sonnet 5": "claude-sonnet-5",
+        "Opus 5": "claude-opus-5",
+        "Haiku 4.5": "claude-haiku-4-5-20251001",
+        "Fable 5": "claude-fable-5",
+    },
     # Tool permissions for the voice session. "ask" is the default ON
     # PURPOSE (safety is opt-out, never opt-in): when the agent wants a
     # gated tool (write a file, run a real command), it ASKS OUT LOUD
@@ -89,6 +101,11 @@ DEFAULTS = {
     # Hold-to-talk key. Named keys ("home", "f13", "right_alt", ...)
     # or a single character.
     "ptt_key": "home",
+    # One tap grabs the whole screen and sends it to the agent as this
+    # turn's image, same as saying "look at my screen". Same naming
+    # rules as ptt_key. Set to "" to disable the hotkey (the spoken
+    # phrase still works either way).
+    "screenshot_key": "f9",
     # The microphone mode. "ptt" (push to talk, the default and the
     # recommendation): the mic is closed except while the key is held,
     # so room audio and your own speakers can never trigger the agent.
@@ -97,9 +114,14 @@ DEFAULTS = {
     # room CAN trigger it, and with open speakers it can hear itself
     # (headphones recommended). The key still works in hands-free
     # listening: it interrupts, and holding it always gets you heard.
-    # Switch live by voice: "go hands free" / "push to talk mode"
-    # (the switch saves itself here). The --open-mic launch flag
-    # forces "open" for one session.
+    # "wake" (hands-free, gated by "hey jarvis"): same always-on mic as
+    # "open", but silent until the wake word fires — room noise and
+    # conversation can't trigger a real action. After the wake word,
+    # ONE request is heard (same capture as "open"), then it goes back
+    # to waiting. Needs the openwakeword package (see wake.py).
+    # Switch live by voice: "go hands free" / "push to talk mode" /
+    # "wake word mode" (the switch saves itself here). The --open-mic
+    # launch flag forces "open" for one session.
     "mic_mode": "ptt",
     # Playback speed for the built-in voice: 1.0 is Kokoro's native
     # pace, 1.15 is noticeably brisker, 0.9 is slower. Kokoro's own
@@ -251,6 +273,15 @@ def load() -> dict:
     cfg["quit_phrases"] = tuple(cfg.get("quit_phrases") or (
         f"goodbye {low}", f"good bye {low}", "end voice mode",
         f"hang up {low}", "hang up"))
+    # Distinct from quit_phrases ON PURPOSE: quitting just ends THIS
+    # voice conversation (the face and any other pieces stay up, ready
+    # for the next "hey jarvis" or a re-launch). These close the WHOLE
+    # running stack — voice line and face both — for when the person
+    # is actually done for the day. See main.py's handling of
+    # shutdown_phrases vs. quit_phrases.
+    cfg["shutdown_phrases"] = tuple(cfg.get("shutdown_phrases") or (
+        f"close {low}", f"shut down {low}", f"shutdown {low}",
+        "close everything", "shut it all down"))
     key_label = "the " + str(cfg.get("ptt_key", "home")).replace("_", " ") \
                 + " key"
     # In hands-free there is no key to hold, so a separate line can be set.

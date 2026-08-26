@@ -259,10 +259,33 @@ class WarmBrain:
             await self._client.disconnect()
             self._client = None
 
-    async def ask_stream(self, utterance: str):
-        """Yield complete sentences as they stream out of the model."""
+    async def ask_stream(self, utterance: str, image_b64: str | None = None,
+                          image_media_type: str = "image/png"):
+        """Yield complete sentences as they stream out of the model.
+
+        image_b64, when given, attaches one image (a screenshot — see
+        screen.py) to this turn as an Anthropic Messages API image
+        content block, alongside the text. The SDK's query() takes a
+        plain string OR an async iterable of message dicts; a single
+        one-item generator is the correct shape for "one turn, richer
+        content" — nothing here is a real multi-message stream."""
         self._dirty = True             # in flight until its ResultMessage
-        await self._client.query(utterance)
+        if image_b64:
+            async def _one_message():
+                yield {
+                    "type": "user",
+                    "message": {"role": "user", "content": [
+                        {"type": "image", "source": {
+                            "type": "base64", "media_type": image_media_type,
+                            "data": image_b64,
+                        }},
+                        {"type": "text", "text": utterance},
+                    ]},
+                    "parent_tool_use_id": None,
+                }
+            await self._client.query(_one_message())
+        else:
+            await self._client.query(utterance)
         buf = ""
         async for msg in self._client.receive_response():
             t = type(msg).__name__

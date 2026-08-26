@@ -54,13 +54,14 @@ Say "goodbye <name>" / "end voice mode" to hang up. Ctrl-C works.
 """
 import asyncio
 import json
+import os
 import queue
 import re
 import sys
 import threading
 import time
 
-from backtalk import signals
+from backtalk import launch, screen, signals, wake
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
 from backtalk.ears import Ears, record_held, warm as warm_ears
@@ -70,6 +71,16 @@ from backtalk.vlog import log
 
 NAME = CFG["name"]
 QUIT_PHRASES = CFG["quit_phrases"]
+SHUTDOWN_PHRASES = CFG["shutdown_phrases"]
+
+# Written for the run's whole lifetime so an outside process (the
+# cold-start listener in wake_listener.py) can tell "backtalk is
+# already up" from "nothing is running" without guessing from
+# .voice_state, which has no liveness signal of its own and would
+# look permanently live after a crash. Removed on any clean exit;
+# left behind after a crash/kill, so a PID check on read is what makes
+# a stale file safe (see wake_listener.is_backtalk_running).
+_LOCK_FILE = os.path.join(CFG["signals_dir"], ".backtalk_pid")
 
 # ---- THE SPOKEN PERMISSION GATE (permission_mode "ask", the default).
 # When the agent wants a gated tool, the SDK routes the decision here:
@@ -82,6 +93,24 @@ _PERM = {"fut": None, "asked_at": 0.0,   # pending ask + when it was posed
          "hinted": False}                # escape-hatch hint said yet?
 _CONFIRM = {"verb": None, "at": 0.0}     # pending "say confirm" + when
 _INTERRUPT_ANSWER = "\x00interrupt"      # sentinel: turn is being killed
+# ---- AUTOMATIC MODEL TIERING (see 07 Problems/... no automatic model
+# tiering note for the full design). Jarvis reads each request's shape
+# and silently runs easy asks on Haiku and everything else on the
+# normal default, except a genuinely hard request, which asks ONCE per
+# session before it's allowed to spend a turn on Opus. "manual_until_
+# fast" is set whenever Mike (or a face) explicitly picks a model, and
+# only cleared by explicitly going back to the fast model — auto-
+# tiering never fights a deliberate choice mid-session.
+_AUTOTIER = {"manual_until_fast": False,   # a manual switch is in effect
+            "opus_ok": False}             # one-time Opus confirm granted?
+# The one-time "okay to use Opus for this?" ask. Same shape as _PERM
+# (a future resolved by the next utterance, spoken, with a timeout) but
+# its OWN slot: _PERM is specifically the SDK's per-tool-call gate,
+# fired from inside can_use_tool, and folding this into it would make
+# handle() misread the ask that follows a hard turn's auto-tier as if
+# it were a tool-permission answer instead of a model-tier one.
+TIER_CONFIRM_TIMEOUT_S = 30
+_TIER_CONFIRM = {"fut": None, "asked_at": 0.0}
 # Live AUTO-APPROVE is OUR flag, not an SDK mode flip: the CLI refuses
 # a live switch INTO bypassPermissions unless it was launched with the
 # danger flag, so instead the gate below auto-approves silently while
@@ -301,6 +330,9 @@ CONSOLE_VERBS = {
                   "hands free listening", "open mic", "open the mic"),
     "micptt":    ("push to talk", "push to talk mode",
                   "back to push to talk", "back to the button"),
+    "micwake":   ("wake word mode", "listen for my wake word",
+                  "listen for wake word", "hey jarvis mode",
+                  "wait for hey jarvis"),
     "noask":     ("stop asking for permission",
                   "stop asking permission",
                   "stop asking me for permission",
@@ -314,8 +346,124 @@ CONSOLE_VERBS = {
                   "auto approve mode"),
     "ask":       ("start asking again", "ask before acting",
                   "ask for permission again"),
+    "launch:study_session": ("start my study session",
+                             "start study session",
+                             "begin my study session"),
 }
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+# ---- DIFFICULTY CLASSIFICATION for automatic model tiering. Jarvis
+# picks the tier itself — Mike never says "easy" or "hard" out loud
+# (see the "no automatic model tiering" problem note). This is a text
+# heuristic on the utterance, not a model call: WarmBrain has exactly
+# one shared message stream (see brain.py), so a real side-query to
+# classify difficulty would either desync that stream or need a whole
+# second SDK client just to answer "easy or hard" — too heavy to pay
+# on every turn. A cheap heuristic costs nothing and is right often
+# enough that being wrong just means a turn runs one tier off, not
+# broken; MEDIUM is the fallback for anything ambiguous, matching
+# today's fixed-model behavior when nothing else fires.
+_HARD_CUES = (
+    "build", "implement", "refactor", "design", "architect", "debug",
+    "migrate", "rewrite", "write a whole", "write a full", "from scratch",
+    "go through all", "go through every", "audit", "review the entire",
+    "review the whole", "plan out", "figure out why", "fix the bug",
+    "walk me through", "step by step", "multiple files", "the whole",
+    "entire codebase", "deep dive",
+)
+_EASY_CUES = (
+    "what time", "what's the time", "what day", "what's today",
+    "hello", "hi jarvis", "hey there", "thanks", "thank you",
+    "good morning", "good night", "what's up", "how are you",
+    "define ", "what does", "what is a", "what is an",
+    "spell ", "translate ", "convert ",
+)
+_EASY_MAX_WORDS = 8
+
+
+def classify_difficulty(text: str) -> str:
+    """"easy" / "medium" / "hard" — see the module-level note above for
+    why this is a heuristic and not a model call. Hard cues win over
+    easy ones (a long or clearly multi-step ask outranks an easy-cue
+    word that happens to appear in it); short+cue-free is the only path
+    to "easy", so a real question never gets starved onto Haiku just
+    for being short-ish ("What's two plus two" is 5 words but has no
+    easy cue — falls through to medium, which is fine: medium is the
+    safe default, not a penalty)."""
+    norm = " ".join(text.lower().split())
+    if any(cue in norm for cue in _HARD_CUES):
+        return "hard"
+    word_count = len(norm.split())
+    if word_count <= _EASY_MAX_WORDS and any(
+            norm.startswith(cue) or cue in norm for cue in _EASY_CUES):
+        return "easy"
+    return "medium"
+
+
+# Reuses config.py's available_models map rather than a new literal —
+# same reasoning as deep_model: one place names model ids.
+_TIER_MODEL = {
+    "easy": CFG["available_models"].get("Haiku 4.5"),
+    "medium": None,       # None = CFG["model"], the fast/default tier
+    "hard": None,         # resolved from CFG["deep_model"] at use time
+}
+
+# Tag prepended to a model id pulled from .model_request so handle()
+# can tell a face's click apart from a person's typed/spoken line —
+# never logged as "[you]", never tested against quit phrases.
+_GUI_MODEL_PREFIX = "\x00gui_model\x00"
+
+# "Look at my screen": unlike CONSOLE_VERBS, this isn't a slash command
+# on the running session — it's a REAL turn (screenshot attached, sent
+# to the model), so it's matched as a leading phrase, not an exact
+# whole-utterance match. "look at my screen, what's this error" still
+# fires and passes the rest through as the question.
+SCREEN_PHRASES = (
+    "look at my screen", "look at the screen", "share my screen",
+    "share the screen", "check my screen", "see my screen",
+    "can you see my screen", "take a screenshot",
+    "what am i looking at", "what's on my screen", "whats on my screen",
+    "what is on my screen", "what am i on right now",
+    "what's on the screen", "whats on the screen",
+    "what is on the screen", "what do you see on my screen",
+    "what can you see on my screen",
+)
+
+
+# Trailer words that carry no question content of their own ("what am I
+# looking at RIGHT NOW" leaves "right now" behind, which read back as a
+# follow-up question would just confuse the vision turn). Stripped from
+# the leftover only when that's ALL that's left, never mid-sentence.
+_SCREEN_LEFTOVER_FILLER = {"right now", "now", "currently", "at"}
+
+
+def _strip_address(text):
+    """Drops a leading 'hey <name>,' / '<name>,' address so it doesn't
+    break a leading-phrase match. Address only — mid-sentence mentions
+    of the agent's name are left alone."""
+    norm = text.strip()
+    lname = NAME.lower()
+    for lead in (f"hey {lname}", lname):
+        if norm.lower().startswith(lead):
+            rest = norm[len(lead):].lstrip(" ,.!?")
+            if rest:
+                return rest
+    return norm
+
+
+def screen_share_match(text):
+    """Returns the leftover question text if a screen-share phrase
+    leads the utterance, else None. 'Look at my screen' alone -> ''
+    (speak_reply gets a sensible default prompt instead)."""
+    text = _strip_address(text)
+    norm = " ".join(text.lower().split())
+    for phrase in SCREEN_PHRASES:
+        if norm.startswith(phrase):
+            rest = text[len(phrase):].strip(" ,.!?")
+            if rest.lower() in _SCREEN_LEFTOVER_FILLER:
+                rest = ""
+            return rest
+    return None
 
 
 def console_match(text):
@@ -568,10 +716,12 @@ def _typed_reader(q: "queue.Queue[str]"):
                 sys.stdout.flush()
 
 
-async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
+async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str,
+                       image_b64: str | None = None):
     """First sentence ships alone (fast start); the rest go in
     2-sentence breaths — fuller chunks get livelier prosody (single
-    short sentences come out flat)."""
+    short sentences come out flat). image_b64, when given, is a
+    screenshot attached to this one turn (see screen.py)."""
     t0 = time.time()
     first = True
     batch: list[str] = []
@@ -609,7 +759,7 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
                 batch = []
 
     try:
-        async for sentence in brain.ask_stream(text):
+        async for sentence in brain.ask_stream(text, image_b64=image_b64):
             emit(sentence)
         if batch:
             mouth.say_chunk(" ".join(batch), pending)
@@ -639,8 +789,12 @@ async def amain():
 
     CFG_BOOT_MODE = CFG["permission_mode"]
     _AUTOAPPROVE["on"] = CFG_BOOT_MODE == "bypassPermissions"
-    _MIC["mode"] = "open" if (open_mic
-                              or CFG.get("mic_mode") == "open") else "ptt"
+    if open_mic:
+        _MIC["mode"] = "open"
+    elif CFG.get("mic_mode") in ("open", "wake"):
+        _MIC["mode"] = CFG["mic_mode"]
+    else:
+        _MIC["mode"] = "ptt"
     # resume_last_session: reattach to the saved conversation, if any
     resume_id = None
     if CFG.get("resume_last_session"):
@@ -696,6 +850,11 @@ async def amain():
         mouth.wait_done(timeout=30)
         raise SystemExit(1)
     log("[backtalk] brain warm")
+    signals.set_current_model(brain.model)
+    # a stale request from before this launch must never silently
+    # reapply — a face reads .model_current as truth and should
+    # re-request if it still wants a switch
+    signals.clear_model_request()
     # the hidden warmup ping is plumbing, not conversation
     brain.session.update(turns=0, out_tokens=0, in_tokens=0, cost=0.0)
     # a configured effort level applies at launch (saved by the spoken
@@ -710,6 +869,8 @@ async def amain():
     speak_task: asyncio.Task | None = None
     typed_q: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=_typed_reader, args=(typed_q,), daemon=True).start()
+    threading.Thread(target=_model_request_watcher, args=(typed_q,), daemon=True).start()
+    threading.Thread(target=_screenshot_key_watcher, args=(typed_q,), daemon=True).start()
     typed_fut: asyncio.Future | None = None
 
     async def run_console(verb):
@@ -740,10 +901,29 @@ async def amain():
                       "get slower. Say back to the fast model when "
                       "you're done.")
             resp = await brain.command(f"/model {CFG['deep_model']}")
+            brain.model = CFG["deep_model"]
+            signals.set_current_model(brain.model)
+            # A manual switch is a deliberate override — auto-tiering
+            # must never fight it mid-session by dropping back down on
+            # its own (see _AUTOTIER / _apply_auto_tier below).
+            _AUTOTIER["manual_until_fast"] = True
             say_after = "Deep model online, for this session only."
         elif verb == "fast":
             resp = await brain.command(f"/model {CFG['model']}")
+            brain.model = CFG["model"]
+            signals.set_current_model(brain.model)
+            _AUTOTIER["manual_until_fast"] = False
             say_after = "Back on the fast model."
+        elif verb.startswith("gui_model:"):
+            model_id = verb.split(":", 1)[1]
+            resp = await brain.command(f"/model {model_id}")
+            brain.model = model_id
+            signals.set_current_model(model_id)
+            signals.clear_model_request()
+            # a face-driven switch is just as deliberate as a spoken
+            # one — auto-tiering must not override it either
+            _AUTOTIER["manual_until_fast"] = model_id != CFG["model"]
+            say_after = f"Switched to {model_id}, from the face."
         elif verb.startswith("effort:"):
             lvl = verb.split(":", 1)[1]
             resp = await brain.command(f"/effort {lvl}")
@@ -783,6 +963,18 @@ async def amain():
                 key = str(CFG.get("ptt_key", "home")).replace("_", " ")
                 mouth.say(f"Push to talk. Hold the {key} key and "
                           "talk; the mic stays closed otherwise.")
+        elif verb == "micwake":
+            resp = ""
+            if _MIC["mode"] == "wake":
+                mouth.say("Already waiting for hey Jarvis.")
+            else:
+                _MIC["mode"] = "wake"
+                _MIC["gen"] += 1
+                _write_config_key("mic_mode", "wake")
+                log("[console] mic_mode -> wake")
+                mouth.say("Wake word mode. I'm listening, but I'll "
+                          "only act after you say hey Jarvis. The "
+                          "talk key still works too.")
         elif verb == "noask":
             resp = ""
             _CONFIRM["verb"] = "noask"
@@ -832,6 +1024,13 @@ async def amain():
                 mouth.say("I saved asking as your default, but this "
                           "session couldn't switch over. Restart the "
                           "voice line to get asking back.")
+        elif verb.startswith("launch:"):
+            resp = ""
+            macro_name = verb.split(":", 1)[1]
+            mouth.say("Starting your study session.")
+            ok = launch.run(macro_name)
+            if not ok:
+                mouth.say("That launch shortcut isn't set up.")
         else:
             resp = ""
         if say_after:
@@ -845,11 +1044,140 @@ async def amain():
                 mouth.say(say_after)
         signals.set_state("idle")
 
+    async def _ask_opus_once() -> bool:
+        """The one-time-per-session "okay to use Opus for hard tasks?"
+        ask. Spoken exactly once per session: a "yes" sets opus_ok for
+        the rest of the session (no more asking); anything else — a
+        no, a timeout, an interruption — declines for THIS turn only
+        and asks again next time a hard task comes up, since Mike might
+        answer differently once he's actually paying attention."""
+        loop = asyncio.get_running_loop()
+        mouth.say("This looks like a hard one — okay if I use Opus? "
+                  "Yes or no?")
+        fut = loop.create_future()
+        _TIER_CONFIRM["fut"] = fut
+        _TIER_CONFIRM["asked_at"] = time.monotonic()
+        try:
+            answer = await asyncio.wait_for(fut, TIER_CONFIRM_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            mouth.say("No answer, so I'll stay on the regular model "
+                      "for this one.")
+            return False
+        finally:
+            _TIER_CONFIRM["fut"] = None
+        approved = _norm_speech(answer) in _YES
+        if approved:
+            _AUTOTIER["opus_ok"] = True
+            log("[tier]   Opus approved for the rest of this session")
+        else:
+            log(f"[tier]   Opus declined: {answer!r}")
+        return approved
+
+    async def _tiered_reply(text: str, target: str, tier: str):
+        """The actual tiered turn, run as ONE task (assigned to
+        speak_task by the caller) so the existing interrupt/cancel
+        machinery in handle() treats it exactly like a normal reply —
+        including a mid-reply cancellation, which must still drop the
+        model back down (the finally below) rather than strand Jarvis
+        on Opus because the user talked over it."""
+        log(f"[tier]   {tier} -> {target} (was {brain.model})")
+        await brain.command(f"/model {target}")
+        brain.model = target
+        signals.set_current_model(target)
+        try:
+            await speak_reply(brain, mouth, text)
+        finally:
+            await brain.command(f"/model {CFG['model']}")
+            brain.model = CFG["model"]
+            signals.set_current_model(brain.model)
+            log(f"[tier]   back to {CFG['model']} after the {tier} turn")
+
+    async def _tier_then_reply(text: str, tier: str, target: str):
+        """Runs entirely INSIDE the speak_task, never awaited by
+        handle() itself. This matters: the main input loop calls
+        `await handle(text)` once per utterance, sequentially (see the
+        while-True loop below), so if the Opus ask were awaited before
+        speak_task existed, the loop would be stuck on that one
+        `await handle(...)` call and could never capture the "yes"/"no"
+        that's supposed to answer it — a deadlock. Wrapping the ask
+        itself inside the task (the same trick make_permission_gate
+        already relies on, since IT runs inside speak_task's own
+        brain.ask_stream() call) keeps the main loop free to keep
+        capturing utterances and feed them to handle(), which is what
+        resolves _TIER_CONFIRM["fut"]."""
+        if tier == "hard" and not _AUTOTIER["opus_ok"]:
+            if not await _ask_opus_once():
+                await speak_reply(brain, mouth, text)
+                return
+        await _tiered_reply(text, target, tier)
+
+    async def _apply_auto_tier(text: str):
+        """Silently pick Haiku/Sonnet/Opus for this ONE turn based on
+        a cheap read of the request (see classify_difficulty above),
+        then run it. Sets speak_task itself, same contract as every
+        other dispatch path in handle(), so an interrupt mid-reply
+        still works normally. Never touches the model if Mike has
+        manually switched it (manual_until_fast) — a deliberate choice
+        always wins over the heuristic."""
+        nonlocal speak_task
+        if not _AUTOTIER["manual_until_fast"]:
+            tier = classify_difficulty(text)
+            target = _TIER_MODEL.get(tier) or (
+                CFG["deep_model"] if tier == "hard" else CFG["model"])
+            if target != brain.model:
+                speak_task = asyncio.create_task(
+                    _tier_then_reply(text, tier, target))
+                return
+        speak_task = asyncio.create_task(speak_reply(brain, mouth, text))
+
+    async def handle_screen_share(question: str):
+        """"Look at my screen[, <question>]": grab the whole virtual
+        desktop and send it as this turn's image, same streaming/speak
+        path as a normal question. The capture itself (~0.5-1s) blocks
+        before any reply starts, so a short spoken heads-up covers that
+        gap — otherwise it just looks like the mic didn't hear anything."""
+        nonlocal speak_task
+        _deny_pending()
+        await brain.reset_turn()
+        mouth.say("Let me take a look.")
+        signals.set_state("thinking")
+        signals.static_start()
+        result = await asyncio.get_event_loop().run_in_executor(None, screen.capture)
+        if result is None:
+            mouth.say("Couldn't grab a screenshot just now — check the log.")
+            signals.set_state("idle")
+            return
+        b64, path = result
+        screen.prune_old_screenshots()
+        log(f"[screen] captured {path}")
+        prompt = question or ("Here's my screen right now. What am I looking at, "
+                              "and is there anything I should know or fix?")
+        speak_task = asyncio.create_task(speak_reply(brain, mouth, prompt, image_b64=b64))
+
     async def handle(text: str, spoke_from: float | None = None) -> bool:
         """Process one utterance; returns False on quit. spoke_from is
         when the utterance STARTED (the PTT press), so an answer can be
         told apart from speech that began before the ask even existed."""
         nonlocal speak_task
+        # A face's model-switch request, injected via the same typed_q
+        # a person's typing uses (see _model_request_watcher below) but
+        # tagged so it never logs as spoken/typed input or gets tested
+        # against quit phrases — it isn't something anyone said.
+        if text.startswith(_GUI_MODEL_PREFIX):
+            model_id = text[len(_GUI_MODEL_PREFIX):]
+            log(f"[console] model switch requested from face: {model_id}")
+            await run_console(f"gui_model:{model_id}")
+            return True
+        # The screenshot hotkey (screen.py's own thread, see
+        # _screenshot_key_watcher) — a key press, not speech, so same
+        # treatment as the model-switch sentinel above.
+        if text == _SCREENSHOT_KEY_SENTINEL:
+            log("[screen] hotkey pressed")
+            if speak_task and not speak_task.done():
+                speak_task.cancel()
+                mouth.shut_up()
+            await handle_screen_share("")
+            return True
         log(f"[you]    {text}")
         # A pending spoken permission ask owns the next utterance IF
         # that utterance started after the ask was posed. Speech that
@@ -863,7 +1191,7 @@ async def amain():
             started_after = (spoke_from is None
                              or spoke_from >= _PERM["asked_at"])
             if _norm_speech(text) in {_norm_speech(q)
-                                      for q in QUIT_PHRASES}:
+                                      for q in QUIT_PHRASES + SHUTDOWN_PHRASES}:
                 _PERM["fut"].set_result("no")
                 # falls through to the quit body below
             elif started_after:
@@ -871,6 +1199,21 @@ async def amain():
                 return True
             else:
                 _deny_pending()
+        # A pending "okay to use Opus?" ask owns the next utterance the
+        # same way, minus the interrupt-vs-answer timing nuance above:
+        # this ask only ever fires from the top of handle() itself
+        # (never mid-turn from inside the SDK), so there's no earlier-
+        # speech-vs-answer ambiguity to resolve. Quit/shutdown still
+        # wins outright — "goodbye jarvis" must hang up even mid-ask,
+        # not get swallowed as a declined answer.
+        if _TIER_CONFIRM["fut"] is not None and not _TIER_CONFIRM["fut"].done():
+            if _norm_speech(text) in {_norm_speech(q)
+                                      for q in QUIT_PHRASES + SHUTDOWN_PHRASES}:
+                _TIER_CONFIRM["fut"].set_result("no")
+                # falls through to the quit body below
+            else:
+                _TIER_CONFIRM["fut"].set_result(text)
+                return True
         # A pending auto-approve confirm owns it too, for two minutes;
         # after that it expires and speech flows normally again.
         verb = None
@@ -881,15 +1224,21 @@ async def amain():
                     "confirm", "confirmed", "yes confirm",
                     "yes confirmed"):
                 verb = pend + ":confirmed"
-            elif not expired and not any(q in text.lower()
-                                         for q in QUIT_PHRASES):
+            elif not expired and not any(
+                    q in text.lower() for q in QUIT_PHRASES + SHUTDOWN_PHRASES):
                 mouth.say("Staying as we are.")
                 return True
-        if any(q in text.lower() for q in QUIT_PHRASES):
+        shutting_down = any(q in text.lower() for q in SHUTDOWN_PHRASES)
+        if shutting_down or any(q in text.lower() for q in QUIT_PHRASES):
             if speak_task and not speak_task.done():
                 speak_task.cancel()
             mouth.shut_up()
-            mouth.say(CFG["signoff"])
+            if shutting_down:
+                mouth.say("Shutting everything down.")
+                mouth.wait_done(timeout=10)
+                launch.kill_face()
+            else:
+                mouth.say(CFG["signoff"])
             mouth.wait_done(timeout=15)
             return False
         if speak_task and not speak_task.done():
@@ -914,6 +1263,10 @@ async def amain():
         if verb:
             await run_console(verb)
             return True
+        screen_question = screen_share_match(text)
+        if screen_question is not None:
+            await handle_screen_share(screen_question)
+            return True
         signals.set_state("thinking")
         signals.static_start()
         # Clean the pipe: drain the interrupted turn's leftovers so the
@@ -922,7 +1275,7 @@ async def amain():
         # wait on a ResultMessage the CLI is withholding for an answer.
         _deny_pending()
         await brain.reset_turn()
-        speak_task = asyncio.create_task(speak_reply(brain, mouth, text))
+        await _apply_auto_tier(text)
         return True
 
     try:
@@ -942,6 +1295,35 @@ async def amain():
         # without barge-in, while the mouth speaks.
         mic_gate = (lambda: _MIC["btn"]
                     or (not barge_in and mouth.speaking))
+
+        def _wake_then_listen(g: int) -> str | None:
+            """Blocks for the wake word, then does ONE normal capture
+            (same as "open" mode) and returns its transcript. Runs on
+            the executor thread, same as ears.listen_once — g is the
+            _MIC generation this call was born under, checked at each
+            stage so a live mode switch abandons it promptly instead of
+            capturing a stray utterance under the old mode.
+
+            require_full_phrase=False: every call here is, by
+            definition, already a running voice session (cold start —
+            launching from nothing running — is wake_listener.py's
+            separate process, which always wants the full phrase and
+            never touches this function). So the bare word "Jarvis"
+            alone is accepted here as well as "hey Jarvis", per the
+            wake-word problem note's decision."""
+            heard = wake.wait_for_wake(
+                gate=mic_gate, abort=lambda: _MIC["gen"] != g,
+                require_full_phrase=False)
+            if not heard or _MIC["gen"] != g:
+                return None
+            signals.set_state("listening")
+            try:
+                return ears.listen_once(
+                    gate=mic_gate, abort=lambda: _MIC["gen"] != g)
+            finally:
+                if _MIC["gen"] == g:
+                    signals.set_state("idle")
+
         mic_fails = 0
         while True:
             if _MIC["gen"] != mic_gen_seen:
@@ -964,6 +1346,12 @@ async def amain():
                         None, lambda g=g: (g, ears.listen_once(
                             gate=mic_gate,
                             abort=lambda: _MIC["gen"] != g)))
+                waiters.add(mic_fut)
+            elif _MIC["mode"] == "wake":
+                if mic_fut is None:
+                    g = _MIC["gen"]
+                    mic_fut = loop.run_in_executor(
+                        None, lambda g=g: (g, _wake_then_listen(g)))
                 waiters.add(mic_fut)
             done, _ = await asyncio.wait(
                 waiters, return_when=asyncio.FIRST_COMPLETED)
@@ -1038,13 +1426,96 @@ async def amain():
         signals.set_state("idle")
         await brain.stop()
         log("[backtalk] hung up")
+        # THE REAL EXIT, not asyncio.run()'s normal return: press_fut
+        # (ptt.py's PTTListener.wait_press, a bare threading.Event.wait()
+        # with no timeout) is ALWAYS outstanding on the default executor
+        # by this point, and it has no abort — it only unblocks on the
+        # NEXT physical key press, which may never come. mic_fut (open
+        # mic / wake mode) has the same shape whenever the abort hasn't
+        # been noticed yet. asyncio.run() calls
+        # loop.shutdown_default_executor(), which BLOCKS until every
+        # submitted executor thread finishes — so with either of those
+        # still alive, the interpreter never actually exits: this log
+        # line prints, and the process just sits there (caught live —
+        # "close jarvis" said goodbye and the process kept running
+        # until something happened to unblock the key listener).
+        # Every resource that matters is already closed above
+        # (mouth/ducker, brain's SDK connection, the signal bus); a
+        # blocked stdlib wait on a daemon-executor thread is not one of
+        # them, so ending the process directly here is the correct fix,
+        # not a workaround. The lock file is removed HERE, not in
+        # main()'s own finally, because os._exit() below never lets
+        # control return there.
+        try:
+            os.remove(_LOCK_FILE)
+        except OSError:
+            pass
+        os._exit(0)
+
+
+_MODEL_REQUEST_POLL_SECONDS = 1.0
+
+
+# Sentinel a screenshot-hotkey press is tagged with, same idea as
+# _GUI_MODEL_PREFIX: handle() must fire the real screen-share turn
+# without logging a fake "[you] ..." line or matching it against
+# console/quit phrases.
+_SCREENSHOT_KEY_SENTINEL = "\x00screenshot_key\x00"
+
+
+def _screenshot_key_watcher(q: "queue.Queue[str]"):
+    """Daemon thread: a SECOND, independent PTTListener on
+    screenshot_key (config.py). One tap (press+release, not held)
+    pushes the sentinel into the same queue typed lines use. Disabled
+    entirely when screenshot_key is empty in config, so nothing runs
+    if the person never wants the hotkey."""
+    key = str(CFG.get("screenshot_key") or "").strip()
+    if not key:
+        return
+    try:
+        listener = PTTListener(key)
+    except Exception as e:
+        log(f"[screen] could not start screenshot hotkey ({key!r}): {e}")
+        return
+    log(f"[screen] hotkey ready: {key}")
+    while True:
+        listener.wait_press()
+        q.put(_SCREENSHOT_KEY_SENTINEL)
+
+
+def _model_request_watcher(q: "queue.Queue[str]"):
+    """Daemon thread: watches .model_request (see signals.py) and, the
+    moment a face writes a model id there, pushes it into the SAME
+    queue a person's typed line goes through — tagged with
+    _GUI_MODEL_PREFIX so handle() routes it to the console instead of
+    treating it as something someone said. Polling, not a filesystem
+    watch: this file changes rarely (a person clicking a picker), so a
+    once-a-second check costs nothing and needs no extra dependency."""
+    seen = None
+    while True:
+        time.sleep(_MODEL_REQUEST_POLL_SECONDS)
+        requested = signals.read_model_request()
+        if requested and requested != seen:
+            seen = requested
+            q.put(_GUI_MODEL_PREFIX + requested)
+        elif not requested:
+            seen = None
 
 
 def main():
     try:
+        with open(_LOCK_FILE, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+    try:
         asyncio.run(amain())
     except KeyboardInterrupt:
         print("\n[backtalk] interrupted — hanging up", flush=True)
+    # No finally/lock-cleanup here: amain()'s own finally calls
+    # os._exit() before control ever returns to this frame — see its
+    # comment for why a normal return can't be trusted to end the
+    # process. The lock file is removed there, right before that exit.
 
 
 if __name__ == "__main__":

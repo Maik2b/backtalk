@@ -15,7 +15,12 @@ dependencies = [
     # platform keeps faster-whisper, which already uses CUDA.
     "mlx-whisper>=0.4.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "numpy>=1.26.0",
+    "openwakeword>=0.6.0",
     "pynput>=1.8.0",
+    # Windows only: the cold-start wake listener's autostart installer
+    # uses it to create a Startup-folder shortcut (see
+    # install_autostart.py). Nothing else in the repo needs it.
+    "pywin32>=312 ; sys_platform == 'win32'",
     "setuptools<81",
     "sounddevice>=0.5.0",
     "soundfile>=0.12.0",

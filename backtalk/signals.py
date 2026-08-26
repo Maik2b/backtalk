@@ -23,6 +23,18 @@ is the whole integration surface:
   .voice_state        idle | listening | thinking | speaking
   .voice_waveform     JSON {ts, samples: [64 floats]} while audio plays
   .voice_loading_pid  exists while the thinking sound is playing
+  .model_current       the full model id actually in use right now
+
+One file runs the other direction, face -> voice line:
+
+  .model_request       a full model id a face wants switched to. main.py
+                        polls this alongside its normal input loop; the
+                        instant it applies the switch, the file is
+                        deleted (so a stale request never reapplies
+                        after a restart) and .model_current is rewritten.
+                        A face should treat a lingering .model_request as
+                        "still pending" and .model_current as the source
+                        of truth for what's actually running.
 
 Written to signals_dir (default: the repo root). Visualizers built on
 this contract just work.
@@ -50,6 +62,8 @@ _WAVEFORM_FILE = os.path.join(_DIR, ".voice_waveform")
 _LOADING_PID_FILE = os.path.join(_DIR, ".voice_loading_pid")
 _DIRECTION_FILE = os.path.join(_DIR, ".voice_direction")
 _REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
+_MODEL_REQUEST_FILE = os.path.join(_DIR, ".model_request")
+_MODEL_CURRENT_FILE = os.path.join(_DIR, ".model_current")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -137,6 +151,35 @@ def reply_done():
     try:
         with open(_REPLY_DONE_FILE, "w") as f:
             f.write(json.dumps({"ts": time.time()}))
+    except OSError:
+        pass
+
+
+def set_current_model(model_id: str):
+    """Publish the model actually in use right now. Never raises."""
+    try:
+        with open(_MODEL_CURRENT_FILE, "w") as f:
+            f.write(model_id)
+    except OSError:
+        pass
+
+
+def read_model_request() -> str | None:
+    """A face's requested model id, or None if no request is pending.
+    Never raises."""
+    try:
+        with open(_MODEL_REQUEST_FILE, "r") as f:
+            requested = f.read().strip()
+        return requested or None
+    except OSError:
+        return None
+
+
+def clear_model_request():
+    """Consume the pending request so it never reapplies on restart.
+    Never raises."""
+    try:
+        os.remove(_MODEL_REQUEST_FILE)
     except OSError:
         pass
 
